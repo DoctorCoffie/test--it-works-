@@ -1,50 +1,149 @@
-# This workflow will build a golang project
-# For more information see:
-# https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+name: CI -
 
-
-          
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
+    tags: [ "v*" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main ]
+
+permissions:
+  contents: write # 
 
 jobs:
-  build-linux:
+  lint:
+    name: Lint (golangci-lint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v6.1.0
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.22.x'
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
 
-      - name: Build on Linux
-        run: go build -o it-works
-
-  build-macos:
-    runs-on: macos-latest
+  test-matrix:
+    name: Test & Build (${{ matrix.os }}, Go ${{ matrix.go }}, ${{ matrix.arch }})
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.21.x', '1.22.x']
+        arch: [amd64, arm64]
+        exclude:
+          - os: windows-latest
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      BINARY_NAME: it-works
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v6.1.0
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-      - name: Build on macOS
-        run: go build -o it-works
+          go-version: ${{ matrix.go }}
+          cache: true
 
-  build-windows:
-    runs-on: windows-latest
+      - name: Set up env (version ldflags)
+        id: meta
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then VERSION="dev-${GITHUB_SHA::7}"; fi
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests (race, cover)
+        run: go test -race -cover -coverprofile=coverage.out ./...
+
+      - name: Fuzz (short sanity)
+        if: runner.os != 'Windows'
+        run: go test -fuzz=Fuzz -fuzztime=5s ./...
+
+      - name: Build binary (GOOS/GOARCH matrix)
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)   GOOS=linux;;
+            macOS)   GOOS=darwin;;
+            Windows) GOOS=windows;;
+          esac
+          BIN=${BINARY_NAME}
+          [[ "$GOOS" == "windows" ]] && BIN+=".exe"
+          echo "Building $BIN for $GOOS/${{ matrix.arch }}"
+          GOOS=$GOOS GOARCH=${{ matrix.arch }} \
+          go build -ldflags "-X github.com/yourname/it-works/internal/itworks.Version=${{ steps.meta.outputs.version }} -X github.com/yourname/it-works/internal/itworks.Commit=${GITHUB_SHA::7} -X github.com/yourname/it-works/internal/itworks.Date=${{ steps.meta.outputs.date }}" \
+                   -o "$BIN" ./cmd/itworks
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Smoke run (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x "$BIN"
+          ./$BIN --repeat=2 --uppercase=true print "it works!!!"
+
+      - name: Smoke run (Windows)
+        if: runner.os == 'Windows'
+        run: .\${{ env.BIN }} --repeat=2 --uppercase=true print "it works!!!"
+        shell: pwsh
+
+      - name: Archive & checksum
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)   GOOS=linux;;
+            macOS)   GOOS=darwin;;
+            Windows) GOOS=windows;;
+          esac
+          ARCH=${{ matrix.arch }}
+          NAME="it-works_${GOOS}_${ARCH}_${{ steps.meta.outputs.version }}"
+          mkdir -p dist
+          cp "$BIN" "dist/it-works"
+          if [[ "$GOOS" == "windows" ]]; then mv dist/it-works dist/it-works.exe; fi
+          (cd dist && zip -r "${NAME}.zip" it-works*)
+          (cd dist && shasum -a 256 "${NAME}.zip" > "${NAME}.zip.sha256") || (cd dist && sha256sum "${NAME}.zip" > "${NAME}.zip.sha256")
+          echo "PKG=dist/${NAME}.zip" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os }}-${{ matrix.arch }}-go${{ matrix.go }}
+          path: |
+            ${{ env.BIN }}
+            dist/*.zip
+            dist/*.sha256
+            coverage.out
+
+  release:
+    name: Release (on tag)
+    needs: [test-matrix]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses:  actions/setup-go@v6.1.0
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          go-version: '1.22'
-
-      - name: Build on Windows
-        run: go build -o it-works.exe
+          path: artifacts
+      - name: Create GitHub Release & upload
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/**/*.zip
+            artifacts/**/**/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
