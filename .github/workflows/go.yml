@@ -33,9 +33,8 @@ jobs:
         uses: actions/setup-go@v6.1.0
         with:
           go-version: '1.22'
-
       - name: Build on macOS
-        run: go build -o it-works
+        run: go mod init && go build -o it-works
 
   build-windows:
     runs-on: windows-latest
